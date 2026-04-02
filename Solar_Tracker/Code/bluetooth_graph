@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Solar Tracker BLE Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; text-align:center; background:#f5f7fa; margin:0; padding:20px;}
+    h1 { margin:6px 0 12px; }
+    #controls { margin-bottom:12px; }
+    button { padding:10px 16px; font-size:15px; border-radius:6px; border:0; background:#007bff; color:#fff; cursor:pointer; }
+    button:disabled { background:#9bbff3; cursor:default; }
+    #status { margin-top:8px; font-weight:600; color:#333; }
+    #log { width:90%; max-width:980px; margin:12px auto; text-align:left; background:#fff; border:1px solid #ddd; padding:8px; height:120px; overflow:auto; font-family:monospace; font-size:13px; }
+    .canvasWrap { width:90%; max-width:980px; margin:14px auto; background:#fff; border-radius:6px; padding:10px; box-shadow:0 2px 6px rgba(0,0,0,0.06); }
+    canvas { width:100% !important; height:260px !important; }
+  </style>
+</head>
+<body>
+  <h1>Solar Tracker — Voltage / Current / Power</h1>
+  <div id="controls">
+    <button id="btnConnect">Connect BLE (NanoBLE_Solar)</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+    <div id="status">Status: Disconnected</div>
+  </div>
+
+  <div id="log">Log:</div>
+
+  <div class="canvasWrap"><canvas id="chartV"></canvas></div>
+  <div class="canvasWrap"><canvas id="chartI"></canvas></div>
+  <div class="canvasWrap"><canvas id="chartP"></canvas></div>
+
+<script>
+/* ====== UUIDs must match the Arduino sketch ====== */
+const SERVICE_UUID   = '12345678-1234-5678-1234-56789abcdef0';
+const VOLT_UUID      = '12345678-1234-5678-1234-56789abcdef1';
+const CURRENT_UUID   = '12345678-1234-5678-1234-56789abcdef2';
+const POWER_UUID     = '12345678-1234-5678-1234-56789abcdef3';
+const DEVICE_NAME    = 'NanoBLE_Solar'; // exact local name advertised
+
+let device = null;
+let server = null;
+let charV = null, charI = null, charP = null;
+let sample = 0;
+
+const LOG = document.getElementById('log');
+function log(s){
+  const t = (new Date()).toLocaleTimeString();
+  LOG.textContent += `\n[${t}] ${s}`;
+  LOG.scrollTop = LOG.scrollHeight;
+}
+function setStatus(s){ document.getElementById('status').textContent = 'Status: ' + s; }
+
+/* ===== Chart setup (Chart.js) ===== */
+function makeChart(ctx, label, color, yLabel){
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: label, data: [], borderColor: color, backgroundColor: 'rgba(0,0,0,0)', pointRadius:0, lineTension: 0.15 }]},
+    options: {
+      animation:false,
+      responsive:true,
+      maintainAspectRatio:false,
+      scales: {
+        x: { display:true, title:{display:true, text:'Samples'} },
+        y: { display:true, title:{display:true, text:yLabel}, beginAtZero:true }
+      },
+      plugins:{ legend:{display:false} }
+    }
+  });
+}
+
+const chartV = makeChart(document.getElementById('chartV').getContext('2d'), 'Voltage (V)', 'rgb(220,50,50)', 'Voltage (V)');
+const chartI = makeChart(document.getElementById('chartI').getContext('2d'), 'Current (A)', 'rgb(50,120,220)', 'Current (A)');
+const chartP = makeChart(document.getElementById('chartP').getContext('2d'), 'Power (W)', 'rgb(50,180,80)', 'Power (W)');
+
+function pushPoint(chart, v){
+  chart.data.labels.push('');
+  chart.data.datasets[0].data.push(v);
+  const MAX = 1200; // keep last N points (you can increase)
+  if(chart.data.labels.length > MAX){
+    chart.data.labels.shift();
+    chart.data.datasets[0].data.shift();
+  }
+  chart.update('none');
+}
+
+/* ===== BLE connect / disconnect ===== */
+document.getElementById('btnConnect').addEventListener('click', connectBle);
+document.getElementById('btnDisconnect').addEventListener('click', disconnectBle);
+
+async function connectBle(){
+  try{
+    setStatus('Requesting device...');
+    log('Requesting Bluetooth device (name filter: ' + DEVICE_NAME + ')');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: DEVICE_NAME }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setStatus('Connecting GATT server...');
+    server = await device.gatt.connect();
+    setStatus('Connected, getting service...');
+    log('Connected to ' + device.name);
+
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    // get characteristics
+    charV = await service.getCharacteristic(VOLT_UUID);
+    charI = await service.getCharacteristic(CURRENT_UUID);
+    charP = await service.getCharacteristic(POWER_UUID);
+
+    // start notifications
+    await charV.startNotifications();
+    await charI.startNotifications();
+    await charP.startNotifications();
+
+    charV.addEventListener('characteristicvaluechanged', e => handleFloat(e, chartV, 'V'));
+    charI.addEventListener('characteristicvaluechanged', e => handleFloat(e, chartI, 'I'));
+    charP.addEventListener('characteristicvaluechanged', e => handleFloat(e, chartP, 'P'));
+
+    document.getElementById('btnConnect').disabled = true;
+    document.getElementById('btnDisconnect').disabled = false;
+    setStatus('Connected — receiving notifications');
+    log('Notifications started for V, I, P');
+  } catch(err){
+    log('Connect error: ' + err);
+    setStatus('Error: ' + err);
+  }
+}
+
+function onDisconnected(e){
+  log('Device disconnected');
+  setStatus('Disconnected');
+  document.getElementById('btnConnect').disabled = false;
+  document.getElementById('btnDisconnect').disabled = true;
+}
+
+/* Clean disconnect */
+async function disconnectBle(){
+  try{
+    if(device && device.gatt && device.gatt.connected) {
+      device.gatt.disconnect();
+      log('Disconnected manually');
+    }
+  } catch(err){ log('Disconnect error: ' + err); }
+  onDisconnected();
+}
+
+/* ===== Data handling =====
+   Arduino sends floats via BLEFloatCharacteristic. We read 32-bit float (little-endian).
+*/
+function handleFloat(event, chart, label){
+  try{
+    const dv = event.target.value; // DataView-like (DataView wrapper is available)
+    // Some browsers give a DataView-like object with getFloat32. Use that:
+    let floatVal;
+    if (typeof dv.getFloat32 === 'function') {
+      floatVal = dv.getFloat32(0, true);
+    } else {
+      // fallback: build DataView
+      const buffer = event.target.value.buffer || event.target.value;
+      const view = new DataView(buffer);
+      floatVal = view.getFloat32(0, true);
+    }
+    sample++;
+    pushPoint(chart, floatVal);
+
+    if (chart === chartV) log(`V=${floatVal.toFixed(3)} V`);
+    if (chart === chartI) log(`I=${floatVal.toFixed(4)} A`);
+    if (chart === chartP) log(`P=${floatVal.toFixed(4)} W`);
+
+    setStatus(`Connected — latest V:${chartV.data.datasets[0].data.slice(-1)[0]?.toFixed(2) || '-'} V`);
+  } catch (err){
+    log('Data parse error: ' + err);
+  }
+}
+
+/* Initialize UI */
+setStatus('Ready (not connected)');
+log('Page loaded. Click Connect BLE. Note: open page from http://localhost or https.');
+</script>
+</body>
+</html>
